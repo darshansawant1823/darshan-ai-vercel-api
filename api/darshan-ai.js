@@ -472,7 +472,14 @@ async function callLLM(request) {
     signal: AbortSignal.timeout(25000),
   })
   // Never return upstream response bodies: they may contain internal configuration.
-  if (!response.ok) throw new Error(`${provider} request failed (${response.status}).`)
+  if (!response.ok) {
+    // Log only a numeric status and allowlisted classification, never the body/key.
+    const upstream = await response.json().catch(() => ({}))
+    const allowedReasons = new Set(["API_KEY_INVALID", "API_KEY_EXPIRED", "API_KEY_SERVICE_BLOCKED", "SERVICE_DISABLED", "BILLING_DISABLED", "RATE_LIMIT_EXCEEDED", "RESOURCE_EXHAUSTED", "PERMISSION_DENIED", "UNAUTHENTICATED", "NOT_FOUND", "INVALID_ARGUMENT"])
+    const reasons = [upstream.error?.status, ...(upstream.error?.details || []).map((detail) => detail.reason)].filter((reason) => allowedReasons.has(reason))
+    console.error("HireHat AI provider failure", JSON.stringify({ provider, status: response.status, reasons }))
+    throw new Error(`${provider} request failed (${response.status}).`)
+  }
   const data = await response.json()
   const candidate = data.candidates?.[0]
   if (isGemini && candidate?.finishReason !== "STOP") throw new Error("Gemini response was blocked or incomplete.")
