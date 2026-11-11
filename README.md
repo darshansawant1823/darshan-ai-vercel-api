@@ -1,4 +1,4 @@
-# Darshan AI Vercel API
+# HireHat AI Vercel API
 
 Tiny Vercel backend for the Framer portfolio AI widget.
 
@@ -21,26 +21,41 @@ darshan-ai-vercel-api/
 1. Create a GitHub repo and upload these files.
 2. In Vercel, import that GitHub repo.
 3. Go to **Environment Variables**.
-4. Add:
+4. For Gemini, add these server-side environment variables:
 
 ```txt
-OPENAI_API_KEY=your_openai_key_here
+AI_PROVIDER=gemini
+GEMINI_API_KEY=<your Google AI Studio API key>
+GEMINI_MODEL=gemini-2.5-flash-lite
 ```
 
-Optional:
+5. Redeploy after saving environment variables. The key must be available in the deployment environment you test (Preview or Production).
+6. Keep the existing Framer endpoint:
 
 ```txt
-OPENAI_MODEL=gpt-4.1-mini
+https://project-r09r8.vercel.app/api/darshan-ai
 ```
 
-5. Redeploy.
-6. Use this endpoint in Framer:
+Never put provider keys in Framer, browser code, GitHub, or a `NEXT_PUBLIC_` variable.
 
-```txt
-https://your-vercel-project.vercel.app/api/darshan-ai
+Gemini 2.5 Flash-Lite has a free tier, subject to your Google project's eligibility and quotas. Confirm the model is available in your AI Studio project. Free-tier content may be used to improve Google's products; do not submit confidential job descriptions or personal information without considering those terms. See [pricing](https://ai.google.dev/gemini-api/docs/pricing) and [API keys](https://ai.google.dev/gemini-api/docs/api-key).
+
+To retain OpenAI instead, use `AI_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL=gpt-4.1-mini`. If `AI_PROVIDER` is absent, the API selects Gemini when `GEMINI_API_KEY` exists, otherwise OpenAI. It never automatically switches providers after a failure or accepts a provider/key/model from browser requests.
+
+### Verify the connection
+
+Run `npm run check` and `npm test` locally. Tests use mocked provider responses and do not use credits or real keys.
+
+After deployment, send an ordinary portfolio question:
+
+```sh
+curl -sS https://project-r09r8.vercel.app/api/darshan-ai \
+  -H 'Content-Type: application/json' \
+  -H 'Origin: https://designbydarshan.framer.website' \
+  --data '{"mode":"chat","question":"What did Darshan work on at Sugarlogger?"}'
 ```
 
-Do not paste your OpenAI key into Framer. Keep it only in Vercel environment variables.
+A successful validated provider response includes `ai.status: "connected"` and `message` (chat) or `result` (job match). HTTP 200 alone does not prove a live LLM connection: provider failures return `ai.status: "unavailable"`, a public `warning`, and the existing limited fallback. The HireHat AI widget displays this warning. Raw provider errors and credentials are not returned. A request times out after 25 seconds.
 
 ## Firewall controls
 

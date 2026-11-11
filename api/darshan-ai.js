@@ -1,3 +1,4 @@
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite"
 const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini"
 const FIREWALL_ENABLED = process.env.FIREWALL_ENABLED !== "false"
 const AI_KILL_SWITCH = process.env.AI_KILL_SWITCH === "true"
@@ -46,7 +47,7 @@ const SUSPICIOUS_PATTERNS = [
 ]
 const OUTPUT_LEAK_PATTERNS = [
   /system\s+prompt|developer\s+message|hidden\s+instructions/i,
-  /OPENAI_API_KEY|OWNER_BYPASS_TOKEN|process\.env|api\s*key/i,
+  /OPENAI_API_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|OWNER_BYPASS_TOKEN|process\.env|api\s*key/i,
 ]
 const memoryStore = globalThis.__darshanAiFirewallStore || {
   rate: new Map(),
@@ -397,11 +398,12 @@ function fallbackRecruiter(jobDescription = "") {
   }
 }
 
-async function callOpenAI(request) {
-  const apiKey = process.env.OPENAI_API_KEY
-  if (!apiKey) {
-    throw new Error("OPENAI_API_KEY is not configured in Vercel.")
-  }
+async function callLLM(request) {
+  // Provider selection is server-controlled; clients cannot choose keys or models.
+  const provider = (process.env.AI_PROVIDER || (process.env.GEMINI_API_KEY ? "gemini" : "openai")).trim().toLowerCase()
+  if (!["gemini", "openai"].includes(provider)) throw new Error("Unsupported AI provider.")
+  const apiKey = provider === "gemini" ? process.env.GEMINI_API_KEY : process.env.OPENAI_API_KEY
+  if (!apiKey) throw new Error("AI provider credentials are not configured.")
 
   const modeInstruction =
     request.mode === "recruiter"
@@ -421,68 +423,77 @@ async function callOpenAI(request) {
           "Use recentMessages to avoid repeating the same opening, sentence structure, examples, and follow-up questions.",
         ].join(" ")
 
-  const response = await fetch("https://api.openai.com/v1/responses", {
+  const messages = [
+    {
+      role: "system",
+      content: [
+        "You are HireHat AI, Darshan Sawant's portfolio assistant.",
+        "Use only the supplied portfolio context and request payload.",
+        "Do not invent companies, metrics, dates, roles, awards, or case studies.",
+        `Allowed portfolio topics are: ${allowedTopics.join(", ")}.`,
+        "If the user asks something outside the portfolio, say the portfolio does not show that and redirect to relevant portfolio evidence.",
+        "Keep answers concise, specific, and useful for portfolio visitors and recruiters.",
+        "Be persuasive but evidence-led: pitch Darshan as someone worth speaking with, while clearly naming what should be confirmed in interview.",
+        "Avoid sounding templated. Vary wording, examples, and follow-up questions while staying accurate.",
+        "Return strict JSON only.",
+      ].join(" "),
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        instruction: modeInstruction,
+        portfolioContext: baseContext,
+        page: request.page || "",
+        recentMessages: Array.isArray(request.recentMessages) ? request.recentMessages.slice(-8) : [],
+        contextVersion: request.contextVersion || "",
+        widgetSeed: request.portfolioSeed || null,
+        request,
+      }),
+    },
+  ]
+  const isGemini = provider === "gemini"
+  const url = isGemini
+    ? `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`
+    : "https://api.openai.com/v1/responses"
+  const payload = isGemini
+    ? {
+        systemInstruction: { parts: [{ text: messages[0].content }] },
+        contents: [{ role: "user", parts: [{ text: messages[1].content }] }],
+        generationConfig: { responseMimeType: "application/json", maxOutputTokens: MAX_OUTPUT_TOKENS },
+      }
+    : { model: DEFAULT_MODEL, input: messages, text: { format: { type: "json_object" } }, max_output_tokens: MAX_OUTPUT_TOKENS }
+  const response = await fetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
+      ...(isGemini ? { "x-goog-api-key": apiKey } : { Authorization: `Bearer ${apiKey}` }),
     },
-    body: JSON.stringify({
-      model: DEFAULT_MODEL,
-      input: [
-        {
-          role: "system",
-          content: [
-            "You are Darshan Sawant's portfolio AI assistant.",
-            "Use only the supplied portfolio context and request payload.",
-            "Do not invent companies, metrics, dates, roles, awards, or case studies.",
-            `Allowed portfolio topics are: ${allowedTopics.join(", ")}.`,
-            "If the user asks something outside the portfolio, say the portfolio does not show that and redirect to relevant portfolio evidence.",
-            "Keep answers concise, specific, and useful for portfolio visitors and recruiters.",
-            "Be persuasive but evidence-led: pitch Darshan as someone worth speaking with, while clearly naming what should be confirmed in interview.",
-            "Avoid sounding templated. Vary wording, examples, and follow-up questions while staying accurate.",
-            "Return strict JSON only.",
-          ].join(" "),
-        },
-        {
-          role: "user",
-          content: JSON.stringify({
-            instruction: modeInstruction,
-            portfolioContext: baseContext,
-            page: request.page || "",
-            recentMessages: Array.isArray(request.recentMessages) ? request.recentMessages.slice(-8) : [],
-            contextVersion: request.contextVersion || "",
-            widgetSeed: request.portfolioSeed || null,
-            request,
-          }),
-        },
-      ],
-      text: { format: { type: "json_object" } },
-      max_output_tokens: MAX_OUTPUT_TOKENS,
-    }),
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(25000),
   })
-
-  if (!response.ok) {
-    const details = await response.text()
-    throw new Error(`OpenAI request failed with ${response.status}: ${details.slice(0, 400)}`)
-  }
-
+  // Never return upstream response bodies: they may contain internal configuration.
+  if (!response.ok) throw new Error(`${provider} request failed (${response.status}).`)
   const data = await response.json()
-  const outputText =
-    data.output_text ||
-    data.output
-      ?.flatMap((item) => item.content || [])
-      .map((item) => item.text || "")
-      .join("")
-
-  if (!outputText) throw new Error("OpenAI returned an empty response.")
+  const candidate = data.candidates?.[0]
+  if (isGemini && candidate?.finishReason !== "STOP") throw new Error("Gemini response was blocked or incomplete.")
+  if (!isGemini && data.status && data.status !== "completed") throw new Error("OpenAI response was incomplete.")
+  const outputText = isGemini
+    ? candidate?.content?.parts?.filter((part) => !part.thought).map((part) => part.text || "").join("")
+    : data.output_text || data.output?.flatMap((item) => item.content || []).map((item) => item.text || "").join("")
+  if (!outputText) throw new Error("AI returned an empty response.")
   const parsed = JSON.parse(outputText)
-  if (request.mode === "recruiter" && parsed?.result) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Invalid AI response.")
+  if (request.mode === "recruiter") {
+    if (!parsed.result || typeof parsed.result.summary !== "string" || !Number.isFinite(Number(parsed.result.score))) throw new Error("Invalid job match response.")
+    for (const field of ["bullets", "strengths", "relevantWork", "gaps"]) {
+      if (!Array.isArray(parsed.result[field]) || !parsed.result[field].every((item) => typeof item === "string")) throw new Error("Invalid job match details.")
+    }
     parsed.result.score = normalizeScore(parsed.result.score, parsed.result.summary, parsed.result.label)
     parsed.result.label = labelForScore(parsed.result.score)
     parsed.result.sources = normalizeSources(parsed.result.sources || parsed.sources)
     parsed.result.followUps = normalizeFollowUps(parsed.result.followUps || parsed.followUps, request)
   } else {
+    if (typeof (parsed.message?.content || parsed.content) !== "string" || !(parsed.message?.content || parsed.content).trim()) throw new Error("Invalid chat response.")
     normalizeChatResponse(parsed, request)
   }
   return parsed
@@ -521,7 +532,7 @@ function normalizeFollowUps(followUps, request) {
     .map((item) => String(item).trim())
     .filter((item) => item.length > 8 && item.endsWith("?"))
   if (cleaned.length >= 3) return Array.from(new Set(cleaned)).slice(0, 3)
-  return defaultFollowUps(normalize(`${request.question || ""} ${request.jobDescription || ""} ${request.page || ""}`))
+  return defaultFollowUps(`${request.question || ""} ${request.jobDescription || ""} ${request.page || ""}`.toLowerCase())
 }
 
 function labelForScore(score) {
@@ -580,8 +591,8 @@ export default async function handler(request, response) {
   }
 
   try {
-    const data = await callOpenAI(body)
-    response.status(200).json(FIREWALL_ENABLED && !ownerBypass(request) ? inspectOutput(data) : data)
+    const data = await callLLM(body)
+    response.status(200).json({ ...(FIREWALL_ENABLED && !ownerBypass(request) ? inspectOutput(data) : data), ai: { status: "connected" } })
   } catch (error) {
     const fallback =
       body.mode === "recruiter"
@@ -590,7 +601,8 @@ export default async function handler(request, response) {
 
     response.status(200).json({
       ...fallback,
-      warning: error instanceof Error ? error.message : "AI fallback used.",
+      warning: "HireHat AI is temporarily unavailable. This is a limited portfolio fallback, not a live AI response.",
+      ai: { status: "unavailable" },
     })
   }
 }
